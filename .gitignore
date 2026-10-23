@@ -1,0 +1,12 @@
+*.img
+*.sqlitedb
+*.db
+*.tar
+*.tar.gz
+*.zip
+*.log
+config.yaml
+process.json
+session/
+data/
+wrapper-runtime/

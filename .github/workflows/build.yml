@@ -12,8 +12,70 @@ on:
 env:
   UPSTREAM_REPOSITORY: WorldObservationLog/wrapper
   UPSTREAM_COMMIT: 2fd7e0eaef081f93cf687428b965674937832ba4
+  DOBBY_REVISION: 9d271803881f467aabfc24593c7dcaeb710fe861
 
 jobs:
+  docker:
+    name: Build Docker image
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_COMMIT }}
+          path: upstream
+
+      - name: Prepare build context
+        run: |
+          sed -i "s/GIT_TAG        master/GIT_TAG        ${DOBBY_REVISION}/" upstream/CMakeLists.txt
+          grep -q "GIT_TAG        ${DOBBY_REVISION}" upstream/CMakeLists.txt
+          cp docker/Dockerfile upstream/apmyx.Dockerfile
+          cp docker/login.sh upstream/apmyx-login.sh
+          printf '.git\n.github\nrootfs/data\ndata\n*.apk\n*.apkm\n*.zip\n' > upstream/apmyx.Dockerfile.dockerignore
+
+      - name: Build image
+        run: |
+          image="apmyx/wrapper-lite:${UPSTREAM_COMMIT:0:7}-${{ github.run_number }}"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          docker build --platform linux/amd64 --file upstream/apmyx.Dockerfile --tag "$image" upstream
+
+      - name: Image has no account data
+        run: |
+          test -z "$(docker run --rm --entrypoint /bin/sh "$IMAGE" -c 'ls -A /app/rootfs/data')"
+
+      - name: Wrapper answers without an account
+        run: |
+          docker volume create check-data
+          docker run --detach --name check --platform linux/amd64 --cap-add SYS_ADMIN --cap-add SYS_CHROOT --cap-add SYS_PTRACE \
+            --security-opt apparmor=unconfined --mount type=volume,source=check-data,target=/app/rootfs/data \
+            --publish 127.0.0.1:12340:12340 "$IMAGE"
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:12340/status > status.json; then break; fi
+            sleep 2
+          done
+          cat status.json
+          grep -q '"code":0' status.json
+          docker logs check | tail -20
+          docker rm --force check
+          docker volume rm check-data
+
+      - name: Save image
+        run: |
+          mkdir dist
+          docker save "$IMAGE" | gzip -9 > dist/wrapper-lite-docker-linux-amd64.tar.gz
+          docker image inspect --format '{{.Id}}' "$IMAGE" > dist/wrapper-lite-docker-linux-amd64.id
+          printf '%s\n' "$IMAGE" > dist/wrapper-lite-docker-linux-amd64.tag
+          ls -la dist
+          cat dist/*.id dist/*.tag
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wrapper-lite-docker-linux-amd64
+          path: dist
+          retention-days: 7
+
   build-assets:
     name: Build wrapper-lite and guest assets
     runs-on: ubuntu-22.04
@@ -267,7 +329,7 @@ jobs:
 
   release:
     name: Publish release
-    needs: verify
+    needs: [verify, docker]
     if: github.event_name == 'workflow_dispatch' && inputs.release
     runs-on: ubuntu-latest
     permissions:
@@ -275,7 +337,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: wrapper-lite-qemu-*
+          pattern: wrapper-lite-*
           merge-multiple: true
           path: assets
 
@@ -285,9 +347,9 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           cd assets
-          sha256sum *.zip > SHA256SUMS
+          sha256sum *.zip *.tar.gz > SHA256SUMS
           cat SHA256SUMS
           tag="lite-${UPSTREAM_COMMIT:0:7}-${{ github.run_number }}"
-          gh release create "$tag" *.zip SHA256SUMS \
-            --title "Wrapper Lite QEMU ${UPSTREAM_COMMIT:0:7} (build ${{ github.run_number }})" \
+          gh release create "$tag" *.zip *.tar.gz *.id *.tag SHA256SUMS \
+            --title "Wrapper Lite ${UPSTREAM_COMMIT:0:7} (build ${{ github.run_number }})" \
             --notes "${UPSTREAM_REPOSITORY}@${UPSTREAM_COMMIT}"
